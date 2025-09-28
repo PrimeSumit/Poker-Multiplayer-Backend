@@ -1,4 +1,5 @@
 import User from "../models/user.js";
+import { getRandomAvatar } from "../utils/avatar.js";
 import { generateToken } from "../utils/generateToken.js";
 
 export const registerUser = async (req, res) => {
@@ -8,13 +9,15 @@ export const registerUser = async (req, res) => {
     if (userExists) {
       return res.status(400).json({ message: "Email already in use" });
     }
+    const avatar = getRandomAvatar();
 
-    const user = await User.create({ username, email, password });
+    const user = await User.create({ username, email, password, avatar });
 
     res.status(201).json({
       _id: user._id,
       username: user.username,
       email: user.email,
+      avatar: user.avatar,
       token: generateToken(user._id),
     });
   } catch (error) {
