@@ -1,13 +1,10 @@
-// src/game/gameUtils.js
 import pkg from "pokersolver";
 const { Hand } = pkg;
 
-// === Constants ===
-export const SMALL_BLIND = 1;
-export const BIG_BLIND = 2;
-export const MAX_RAISE = 150;
-
-// === Deck Utilities ===
+/**
+ * Creates a standard 52-card deck.
+ * @returns {string[]} An array of cards, e.g., ["As", "Kd", ...].
+ */
 export function createDeck() {
   const suits = ["s", "h", "d", "c"];
   const ranks = [
@@ -30,6 +27,11 @@ export function createDeck() {
   return deck;
 }
 
+/**
+ * Shuffles an array of cards in place.
+ * @param {string[]} deck - The deck of cards to shuffle.
+ * @returns {string[]} The shuffled deck.
+ */
 export function shuffle(deck) {
   for (let i = deck.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -38,20 +40,27 @@ export function shuffle(deck) {
   return deck;
 }
 
-// === Dealing ===
+/**
+ * Deals two hole cards to each active player.
+ * @param {object[]} players - The array of player objects.
+ * @param {string[]} deck - The shuffled deck of cards.
+ */
 export function dealHoleCards(players, deck) {
   players.forEach((p) => {
     if (!p.isSpectator && p.chips > 0) {
       p.cards = [deck.pop(), deck.pop()];
-      p.currentBet = 0;
-      p.hasFolded = false;
-      p.isAllIn = false;
     }
   });
 }
 
+/**
+ * Deals the community cards for a given stage (flop, turn, or river).
+ * @param {string[]} deck - The deck of cards.
+ * @param {string} stage - The current betting round ('flop', 'turn', 'river').
+ * @returns {string[]} An array of community cards.
+ */
 export function dealCommunityCards(deck, stage) {
-  if (deck.length > 0) deck.pop(); // burn
+  if (deck.length > 0) deck.pop(); // Burn a card
   switch (stage) {
     case "flop":
       return [deck.pop(), deck.pop(), deck.pop()];
@@ -63,31 +72,39 @@ export function dealCommunityCards(deck, stage) {
   }
 }
 
-// === Winners ===
+/**
+ * Determines the winner(s) of the hand from the eligible players.
+ * @param {object[]} players - Players still in the hand.
+ * @param {string[]} communityCards - The community cards on the board.
+ * @returns {object[]} An array of winner objects.
+ */
 export function determineWinners(players, communityCards) {
   try {
     const active = players.filter((p) => !p.hasFolded && !p.isSpectator);
     if (active.length === 0) return [];
+
+    // If only one player is left, they win by default.
     if (active.length === 1) {
       const p = active[0];
       return [
         {
           id: p.id,
           username: p.username,
-          handName: null,
-          handDescr: "Win by fold",
+          handName: "Winner",
+          handDescr: "Win by default",
         },
       ];
     }
 
-    const solved = active.map((p) => {
-      const combined = [...(p.cards || []), ...(communityCards || [])];
-      const hand = Hand.solve(combined);
+    const solvedHands = active.map((p) => {
+      const combinedCards = [...(p.cards || []), ...(communityCards || [])];
+      const hand = Hand.solve(combinedCards);
       return { player: p, hand };
     });
 
-    const winnerHands = Hand.winners(solved.map((s) => s.hand));
-    const winners = solved
+    const winnerHands = Hand.winners(solvedHands.map((s) => s.hand));
+
+    const winners = solvedHands
       .filter((s) => winnerHands.some((wh) => wh.descr === s.hand.descr))
       .map((s) => ({
         id: s.player.id,
@@ -98,7 +115,8 @@ export function determineWinners(players, communityCards) {
 
     return winners;
   } catch (err) {
-    console.error("determineWinners error:", err);
+    console.error("Error determining winners:", err);
+    // Fallback in case of a library error.
     const active = players.filter((p) => !p.hasFolded && !p.isSpectator);
     if (active.length === 0) return [];
     const p = active[0];
@@ -106,45 +124,9 @@ export function determineWinners(players, communityCards) {
       {
         id: p.id,
         username: p.username,
-        handName: null,
-        handDescr: "Fallback winner",
+        handName: "Error",
+        handDescr: "Fallback winner due to error",
       },
     ];
   }
-}
-
-// === Betting Helpers ===
-export function validateRaise(amount) {
-  return Math.min(amount, MAX_RAISE);
-}
-
-export function collectBets(players) {
-  let pot = 0;
-  players.forEach((p) => {
-    if (!p.isSpectator) {
-      pot += p.currentBet;
-      p.currentBet = 0;
-    }
-  });
-  return pot;
-}
-
-export function allPlayersChecked(players, currentBet) {
-  return players
-    .filter((p) => !p.hasFolded && !p.isAllIn && !p.isSpectator)
-    .every((p) => p.currentBet === currentBet);
-}
-
-// === Player Turn Helpers ===
-export function findNextActiveIndex(room) {
-  const players = room.players || [];
-  if (players.length === 0) return null;
-  let start = room.currentPlayerIndex % players.length;
-  for (let i = 0; i < players.length; i++) {
-    const idx = (start + i) % players.length;
-    const p = players[idx];
-    if (!p) continue;
-    if (!p.hasFolded && !p.isAllIn && !p.isSpectator && p.chips > 0) return idx;
-  }
-  return null;
 }

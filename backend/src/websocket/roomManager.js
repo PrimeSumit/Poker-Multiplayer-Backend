@@ -1,17 +1,24 @@
 import { generateRoomId } from "../utils/generateRoomId.js";
 
-let rooms = {}; // in-memory store
+let rooms = {}; // In-memory store for rooms
 
-/** Create a room */
+/**
+ * Creates a new poker room with specified settings.
+ * @param {object} options - The options for creating the room.
+ * @param {string} options.region - The server region.
+ * @param {number} options.maxPlayers - The maximum number of players.
+ * @param {string} options.password - An optional password for the room.
+ * @returns {object} The newly created room object.
+ */
 export function createRoom({ region = "IN", maxPlayers = 5, password = "" }) {
   const roomId = generateRoomId(region);
   rooms[roomId] = {
     id: roomId,
     region,
     password,
-    maxPlayers: Math.min(maxPlayers, 5),
+    maxPlayers: Math.min(maxPlayers, 5), // Capped at 5 players
     players: [],
-    game: null,
+    game: null, // Game state object, initialized later
     lastActive: Date.now(),
     dealerIndex: -1,
     deck: null,
@@ -22,11 +29,18 @@ export function createRoom({ region = "IN", maxPlayers = 5, password = "" }) {
   return rooms[roomId];
 }
 
-/** Join a room */
+/**
+ * Allows a player to join an existing room.
+ * @param {string} roomId - The ID of the room to join.
+ * @param {string} password - The password for the room, if required.
+ * @returns {object} The room object if join is successful.
+ * @throws {Error} If the room doesn't exist, is full, or password is wrong.
+ */
 export function joinRoom(roomId, password) {
   const room = rooms[roomId];
   if (!room) throw new Error("Room does not exist");
-  if (room.password !== password) throw new Error("Invalid password");
+  if (room.password && room.password !== password)
+    throw new Error("Invalid password");
 
   const activeCount = room.players.filter((p) => !p.isSpectator).length;
   if (activeCount >= room.maxPlayers) {
@@ -37,7 +51,12 @@ export function joinRoom(roomId, password) {
   return room;
 }
 
-/** Leave a room */
+/**
+ * Handles a player leaving a room or disconnecting.
+ * @param {string} roomId - The ID of the room.
+ * @param {string} socketId - The socket ID of the player leaving.
+ * @param {object} io - The Socket.IO server instance for broadcasting updates.
+ */
 export function leaveRoom(roomId, socketId, io) {
   const room = rooms[roomId];
   if (!room) return;
@@ -49,7 +68,7 @@ export function leaveRoom(roomId, socketId, io) {
   const isHandInProgress = !!room.deck;
 
   if (isHandInProgress) {
-    console.log(`${player.username} disconnected mid-hand, folding.`);
+    console.log(`${player.username} disconnected mid-hand, marking as folded.`);
     player.hasFolded = true;
     player.isDisconnected = true;
   } else {
@@ -57,58 +76,53 @@ export function leaveRoom(roomId, socketId, io) {
     room.players.splice(playerIndex, 1);
   }
 
-  if (io) io.to(roomId).emit("roomUpdate", roomSummary(room));
-
+  // If room is empty, delete it. Otherwise, update clients.
   if (room.players.filter((p) => !p.isDisconnected).length === 0) {
     delete rooms[roomId];
     console.log(`Room ${roomId} deleted (empty).`);
   } else {
+    io.to(roomId).emit("roomUpdate", roomSummary(room));
     room.lastActive = Date.now();
   }
 }
 
-/** Get room object */
+/**
+ * Retrieves a room by its ID.
+ * @param {string} roomId - The ID of the room.
+ * @returns {object|undefined} The room object or undefined if not found.
+ */
 export function getRoom(roomId) {
   return rooms[roomId];
 }
 
-/** Return all rooms */
-export function getAllRooms() {
-  return rooms;
-}
-
-/** Get active players */
+/**
+ * Get active players in a room.
+ * @param {string} roomId - The ID of the room.
+ * @returns {Array} An array of active player objects.
+ */
 export function getActivePlayers(roomId) {
-  // <-- ADDED EXPORT
   const room = rooms[roomId];
   if (!room) return [];
   return room.players.filter((p) => !p.isSpectator && p.chips > 0);
 }
 
-/** Get spectators */
+/**
+ * Get spectators in a room.
+ * @param {string} roomId - The ID of the room.
+ * @returns {Array} An array of spectator objects.
+ */
 export function getSpectators(roomId) {
-  // <-- ADDED EXPORT
   const room = rooms[roomId];
   if (!room) return [];
   return room.players.filter((p) => p.isSpectator);
 }
 
-/** Start periodic cleanup of inactive rooms */
-export function startRoomExpiryWatcher(timeoutMs = 30 * 60 * 1000) {
-  setInterval(() => {
-    const now = Date.now();
-    for (const [id, room] of Object.entries(rooms)) {
-      if (now - room.lastActive > timeoutMs) {
-        console.log(`Room ${id} expired and removed`);
-        delete rooms[id];
-      }
-    }
-  }, 60 * 1000);
-}
-
-/** Initialize game object */
+/**
+ * Initialize the game state object for a room.
+ * @param {object} room - The room object.
+ */
 export function initGame(room) {
-  // <-- ADDED EXPORT
+  if (!room) return;
   room.game = {
     stage: "pre-flop",
     currentPlayerIdx: 0,
@@ -116,9 +130,28 @@ export function initGame(room) {
   };
 }
 
-/** Helper for broadcasting updates */
+/**
+ * Periodically cleans up inactive rooms.
+ * @param {number} timeoutMs - The inactivity timeout in milliseconds.
+ */
+export function startRoomExpiryWatcher(timeoutMs = 30 * 60 * 1000) {
+  setInterval(() => {
+    const now = Date.now();
+    for (const [id, room] of Object.entries(rooms)) {
+      if (now - room.lastActive > timeoutMs) {
+        console.log(`Room ${id} expired and removed due to inactivity`);
+        delete rooms[id];
+      }
+    }
+  }, 60 * 1000); // Check every minute
+}
+
+/**
+ * Returns a summary of a room, safe to send to clients.
+ * @param {object} room - The room object.
+ * @returns {object} A summary of the room.
+ */
 export function roomSummary(room) {
-  // <-- ADDED EXPORT
   if (!room) return {};
   return {
     id: room.id,
@@ -129,14 +162,19 @@ export function roomSummary(room) {
       username: p.username,
       avatar: p.avatar,
       chips: p.chips,
-      isDisconnected: p.isDisconnected,
+      isDisconnected: !!p.isDisconnected,
     })),
   };
 }
 
-/** Find next active player */
+/**
+ * Finds the index of the next active player in a room, starting from a given index.
+ * This is crucial for managing turn order.
+ * @param {object} room - The room object.
+ * @param {number} start - The index to start searching from.
+ * @returns {number|null} The index of the next active player, or null if none found.
+ */
 export function findNextActiveIndexFrom(room, start) {
-  // <-- ADDED MISSING FUNCTION
   if (!room.players || room.players.length === 0) return null;
   const total = room.players.length;
   for (let i = 0; i < total; i++) {
@@ -152,5 +190,5 @@ export function findNextActiveIndexFrom(room, start) {
     )
       return idx;
   }
-  return null; // Return null if no active player found
+  return null; // No active player found
 }
