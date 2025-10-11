@@ -8,7 +8,7 @@ import {
 import { getRoom, findNextActiveIndexFrom } from "../websocket/roomManager.js";
 
 const AUTO_NEXT_HAND_DELAY = 7000;
-const TURN_TIMEOUT = 60000; // Changed from 20000 to 60000 (1 minute)
+const TURN_TIMEOUT = 60000;
 const turnTimers = {};
 
 /** Start a new hand */
@@ -16,14 +16,12 @@ export function startGame(roomId, io) {
   const room = getRoom(roomId);
   if (!room || !room.players) return;
 
-  // Remove disconnected players between hands
   room.players = room.players.filter((p) => !p.isDisconnected);
   if (room.players.length < 2) {
     io.to(room.id).emit("handCancelled", { reason: "Not enough players." });
     return;
   }
 
-  // Reset players for the new hand
   room.players.forEach((p) => {
     p.cards = [];
     p.currentBet = 0;
@@ -49,13 +47,13 @@ export function startGame(roomId, io) {
   room.pots = [];
   room.currentRound = "pre-flop";
   room.minBet = 2; // Big blind amount
-  room.lastRaise = 2; // Initialize with big blind amount for pre-flop
-  room.bigBlindIndex = bigBlindIndex; // Store big blind's index
-  room.bigBlindHasOption = true; // Flag for the big blind's pre-flop option
+  room.lastRaise = 2;
+  room.bigBlindIndex = bigBlindIndex;
+  // MODIFIED: We use the big blind index to track the initial 'aggressor'.
+  room.lastRaiserIndex = bigBlindIndex;
   room.currentPlayerIndex = findNextActiveIndexFrom(room, bigBlindIndex + 1);
   room.handEnded = false;
 
-  // Post blinds
   postBlind(room.players[smallBlindIndex], 1, room);
   postBlind(room.players[bigBlindIndex], 2, room);
 
@@ -93,9 +91,13 @@ export function playerAction(roomId, playerId, action, amount = 0, io) {
 
   clearTimeout(turnTimers[room.id]);
 
-  // The big blind's option is used or voided once they act or someone raises.
-  if (playerIdx === room.bigBlindIndex || action === "raise") {
-    room.bigBlindHasOption = false;
+  // The big blind's option is only used once.
+  if (
+    playerIdx === room.bigBlindIndex &&
+    room.currentRound === "pre-flop" &&
+    room.minBet === 2
+  ) {
+    room.lastRaiserIndex = -1; // Special case for BB option
   }
 
   switch (action) {
@@ -103,12 +105,11 @@ export function playerAction(roomId, playerId, action, amount = 0, io) {
       player.hasFolded = true;
       break;
     case "check":
-      // FIX: A player can only check if their bet matches the current minimum bet.
       if (player.currentBet < room.minBet) {
         io.to(playerId).emit("actionRejected", {
           reason: "You cannot check, you must call, raise, or fold.",
         });
-        return; // Reject invalid action
+        return;
       }
       break;
     case "call": {
@@ -122,23 +123,53 @@ export function playerAction(roomId, playerId, action, amount = 0, io) {
       const totalBet = amount;
       const raiseAmount = totalBet - player.currentBet;
       const minRaiseAmount = room.lastRaise;
+      const isAllIn = raiseAmount >= player.chips;
 
-      if (
-        totalBet < room.minBet + minRaiseAmount || // Must raise at least the last raise amount
-        raiseAmount <= 0 ||
-        raiseAmount > player.chips
-      ) {
+      // NEW: Check if the player is facing an incomplete raise
+      const lastRaiser = room.players[room.lastRaiserIndex];
+      const isFacingIncompleteRaise =
+        lastRaiser &&
+        lastRaiser.isAllIn &&
+        room.minBet - (room.minBet - room.lastRaise) < minRaiseAmount;
+
+      if (isFacingIncompleteRaise) {
+        io.to(playerId).emit("actionRejected", {
+          reason: "You cannot re-raise an incomplete all-in raise.",
+        });
+        return;
+      }
+
+      // MODIFIED: The total bet must be at least the current bet plus the minimum raise, UNLESS it's an all-in.
+      if (!isAllIn && totalBet < room.minBet + minRaiseAmount) {
         io.to(playerId).emit("actionRejected", {
           reason: `Invalid raise amount. Must raise at least to ${
             room.minBet + minRaiseAmount
           }.`,
         });
-        return; // Invalid raise
+        return;
+      }
+
+      if (raiseAmount <= 0 || raiseAmount > player.chips) {
+        io.to(playerId).emit("actionRejected", {
+          reason: "Invalid raise amount.",
+        });
+        return;
       }
 
       player.chips -= raiseAmount;
       player.currentBet = totalBet;
-      room.lastRaise = totalBet - room.minBet; // The amount *on top of* the previous bet
+
+      // NEW: Differentiate between a full raise and an incomplete one
+      const fullRaiseAmount = totalBet - room.minBet;
+      if (!isAllIn && fullRaiseAmount >= minRaiseAmount) {
+        // This is a full, legitimate raise
+        room.lastRaiserIndex = playerIdx;
+        room.lastRaise = fullRaiseAmount;
+      } else {
+        // This is an incomplete all-in raise, it does NOT re-open the action.
+        // We do not update lastRaiserIndex.
+      }
+
       room.minBet = player.currentBet;
       if (player.chips <= 0) player.isAllIn = true;
       break;
@@ -160,7 +191,7 @@ export function playerAction(roomId, playerId, action, amount = 0, io) {
   }
 }
 
-/** Reconcile pots */
+// reconcilePots function remains the same...
 function reconcilePots(room) {
   const playersInHand = room.players.filter(
     (p) => p.currentBet > 0 || p.isAllIn || !p.hasFolded
@@ -187,7 +218,6 @@ function reconcilePots(room) {
       }
     });
 
-    // Merge with existing pots if eligible players are the same
     const existingPot = room.pots.find(
       (p) =>
         JSON.stringify(p.eligiblePlayers.sort()) ===
@@ -205,48 +235,55 @@ function reconcilePots(room) {
   room.players.forEach((p) => (p.currentBet = 0));
 }
 
-/** Check if betting round complete */
+// MODIFIED: The logic for checking round completion is now more robust.
 function isBettingRoundComplete(room) {
   const activePlayers = room.players.filter(
-    (p) => !p.hasFolded && !p.isSpectator && p.chips > 0 && !p.isAllIn
+    (p) => !p.hasFolded && !p.isAllIn && !p.isSpectator
   );
 
-  // If 0 or 1 active players are left who can act, betting is over.
+  // If 1 or 0 players can act, betting is over.
   if (activePlayers.length <= 1) {
-    const allInPlayers = room.players.filter((p) => p.isAllIn);
-    // Everyone is all-in or folded, proceed
-    if (activePlayers.length === 0 && allInPlayers.length > 0) return true;
+    const playersInHand = room.players.filter(
+      (p) => !p.hasFolded && !p.isSpectator
+    );
+    // If only one person is left in the hand at all, round is over.
+    if (playersInHand.length <= 1) return true;
+  }
 
-    // Check if the single active player needs to call
-    const highestBet = room.minBet;
+  // Find the index of the player who made the last legitimate raise.
+  const aggressorIndex = room.lastRaiserIndex;
+
+  // Special pre-flop BB option case
+  if (room.currentRound === "pre-flop" && aggressorIndex === -1) {
+    if (room.currentPlayerIndex === room.bigBlindIndex) return true;
+  }
+
+  // The round is over if the action has returned to the last aggressor.
+  if (room.currentPlayerIndex === aggressorIndex) {
+    return true;
+  }
+
+  // The round is also over if all remaining players have matched the bet and the aggressor has acted.
+  const allMatched = activePlayers.every((p) => p.currentBet === room.minBet);
+  if (allMatched && aggressorIndex !== null) {
+    // Check if the current player is the one who made the last raise (and action came around)
+    const playerAfterAggressor = findNextActiveIndexFrom(room, aggressorIndex);
     if (
-      activePlayers.length === 1 &&
-      activePlayers[0].currentBet < highestBet
+      room.currentPlayerIndex === playerAfterAggressor ||
+      activePlayers.length <= 1
     ) {
-      return false;
+      return true;
     }
   }
 
-  const allBetsEqual = activePlayers.every((p) => p.currentBet === room.minBet);
-
-  if (!allBetsEqual) {
-    return false; // If bets aren't equal, round is definitely not over.
-  }
-
-  // If all bets ARE equal, we must still check if the big blind has exercised their option pre-flop.
-  if (room.currentRound === "pre-flop" && room.bigBlindHasOption) {
-    return false;
-  }
-
-  // If bets are equal and it's not the BB option scenario, the round is complete.
-  return true;
+  return false;
 }
 
-/** Next round / showdown */
+// nextRound function remains the same...
 function nextRound(io, room) {
   reconcilePots(room);
   room.minBet = 0;
-  room.lastRaise = 2; // Reset for next round (must bet at least big blind)
+  room.lastRaise = 2; // Reset for next round
 
   const remaining = room.players.filter((p) => !p.hasFolded);
   if (remaining.length <= 1) {
@@ -288,7 +325,9 @@ function nextRound(io, room) {
       break;
   }
 
+  // NEW: Action starts with the first active player after the dealer.
   room.currentPlayerIndex = findNextActiveIndexFrom(room, room.dealerIndex + 1);
+  room.lastRaiserIndex = room.currentPlayerIndex; // The first player to act is the initial 'aggressor' post-flop.
 
   io.to(room.id).emit("nextRound", {
     round: room.currentRound,
@@ -298,7 +337,7 @@ function nextRound(io, room) {
   emitTurn(io, room);
 }
 
-/** Showdown */
+// showdown and helper functions remain the same...
 function showdown(io, room) {
   room.handEnded = true;
   reconcilePots(room);
@@ -343,7 +382,6 @@ function showdown(io, room) {
   autoNextHand(room.id, io);
 }
 
-/** Helpers */
 function postBlind(player, amount, room) {
   if (!player || player.isSpectator) return;
   const pay = Math.min(player.chips, amount);
@@ -362,12 +400,15 @@ function advanceTurn(io, room) {
 
 function emitTurn(io, room) {
   if (room.handEnded) return;
+
+  // NEW: Check if the round should end before emitting the next turn.
+  if (isBettingRoundComplete(room)) {
+    nextRound(io, room);
+    return;
+  }
+
   const player = room.players[room.currentPlayerIndex];
   if (!player) {
-    // This can happen if all other players fold, check isBettingRoundComplete logic
-    if (isBettingRoundComplete(room)) {
-      nextRound(io, room);
-    }
     return;
   }
 
