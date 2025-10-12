@@ -11,7 +11,7 @@ export function createRoom({ region = "IN", maxPlayers = 5, password = "" }) {
     id: roomId,
     region,
     password,
-    maxPlayers: Math.min(maxPlayers, 5), // Capped at 5 players
+    maxPlayers: Math.min(maxPlayers, 6),
     players: [],
     lastActive: Date.now(), // Game state is managed by gameLogic.js, but initial values are here
     dealerIndex: -1,
