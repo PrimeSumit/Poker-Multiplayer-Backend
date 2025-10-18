@@ -4,12 +4,22 @@ import {
   dealHoleCards,
   dealCommunityCards,
   determineWinners,
-} from "./gameUtils.js";
-import { getRoom, findNextActiveIndexFrom } from "../websocket/roomManager.js";
+} from "./game_utils.js";
+import { getRoom, findNextActiveIndexFrom } from "../websocket/room_manager.js";
 
-const AUTO_NEXT_HAND_DELAY = 7000;
+const AUTO_NEXT_HAND_DELAY = 7000; // Delay for regular hand restart
+const FULL_GAME_RESET_DELAY = 10000; // Longer delay to announce winner before reset
 const TURN_TIMEOUT = 60000;
+const INITIAL_CHIPS = 1000; // Defined constant for buy-in/reset
 const turnTimers = {};
+
+/** Checks if the entire tournament/game is over (one or zero players left with chips). */
+function checkIfFullGameOver(room) {
+  const playersWithChips = room.players.filter(
+    (p) => !p.isDisconnected && p.chips > 0
+  );
+  return playersWithChips.length <= 1;
+}
 
 /** Start a new hand */
 export function startGame(roomId, io) {
@@ -27,13 +37,16 @@ export function startGame(roomId, io) {
     p.currentBet = 0;
     p.hasFolded = false;
     p.isAllIn = false;
+
+    // CRITICAL FIX: Chips are cumulative. Players with 0 chips are spectators.
+    // Chips are only refilled via endGameAndReset, not between hands.
     p.isSpectator = p.chips <= 0;
   });
 
   const activePlayers = room.players.filter((p) => !p.isSpectator);
   if (activePlayers.length < 2) {
     io.to(room.id).emit("handCancelled", {
-      reason: "Not enough active players.",
+      reason: "Not enough active players to start (less than 2 with chips).",
     });
     return;
   }
@@ -78,16 +91,51 @@ export function startGame(roomId, io) {
   emitTurn(io, room);
 }
 
-/** Player action */
-export function playerAction(roomId, playerId, action, amount = 0, io) {
+/** * Player action - Fold, Call, Raise.
+ * FIX C: Added callback to report all failures explicitly instead of silent returns.
+ */
+export function playerAction(
+  roomId,
+  playerId,
+  action,
+  amount = 0,
+  io,
+  callback
+) {
   const room = getRoom(roomId);
-  if (!room || room.handEnded) return;
+
+  if (!room || !action) {
+    if (callback)
+      callback({ success: false, error: "Invalid room or action payload." });
+    return;
+  }
+
+  if (room.handEnded) {
+    // Check for hand ended
+    if (callback)
+      callback({ success: false, error: "The current hand has ended." });
+    return;
+  }
 
   const playerIdx = room.players.findIndex((p) => p.id === playerId);
-  if (playerIdx === -1 || playerIdx !== room.currentPlayerIndex) return;
-
   const player = room.players[playerIdx];
-  if (player.hasFolded || player.isAllIn || player.isSpectator) return;
+
+  // Validation: Player not found OR it's not their turn (already checked in socket.js, but defensive check)
+  if (playerIdx === -1) {
+    if (callback)
+      callback({ success: false, error: "Player not found in room." });
+    return;
+  }
+
+  // Validation: Player state allows action
+  if (player.hasFolded || player.isAllIn || player.isSpectator) {
+    if (callback)
+      callback({
+        success: false,
+        error: "Player cannot act: already folded, all-in, or spectator.",
+      });
+    return;
+  }
 
   clearTimeout(turnTimers[room.id]);
 
@@ -106,9 +154,9 @@ export function playerAction(roomId, playerId, action, amount = 0, io) {
       break;
     case "check":
       if (player.currentBet < room.minBet) {
-        io.to(playerId).emit("actionRejected", {
-          reason: "You cannot check, you must call, raise, or fold.",
-        });
+        // Must reject check if player needs to match a bet
+        if (callback)
+          callback({ success: false, error: "You must call, raise, or fold." });
         return;
       }
       break;
@@ -125,7 +173,7 @@ export function playerAction(roomId, playerId, action, amount = 0, io) {
       const minRaiseAmount = room.lastRaise;
       const isAllIn = raiseAmount >= player.chips;
 
-      // NEW: Check if the player is facing an incomplete raise
+      // Check if the player is facing an incomplete raise (prevent re-raising incomplete)
       const lastRaiser = room.players[room.lastRaiserIndex];
       const isFacingIncompleteRaise =
         lastRaiser &&
@@ -133,47 +181,53 @@ export function playerAction(roomId, playerId, action, amount = 0, io) {
         room.minBet - (room.minBet - room.lastRaise) < minRaiseAmount;
 
       if (isFacingIncompleteRaise) {
-        io.to(playerId).emit("actionRejected", {
-          reason: "You cannot re-raise an incomplete all-in raise.",
-        });
+        if (callback)
+          callback({
+            success: false,
+            error: "You cannot re-raise an incomplete all-in raise.",
+          });
         return;
       }
 
-      // MODIFIED: The total bet must be at least the current bet plus the minimum raise, UNLESS it's an all-in.
+      // The total bet must be at least the current bet plus the minimum raise, UNLESS it's an all-in.
       if (!isAllIn && totalBet < room.minBet + minRaiseAmount) {
-        io.to(playerId).emit("actionRejected", {
-          reason: `Invalid raise amount. Must raise at least to ${
-            room.minBet + minRaiseAmount
-          }.`,
-        });
+        if (callback)
+          callback({
+            success: false,
+            error: `Invalid raise amount. Must raise at least to ${
+              room.minBet + minRaiseAmount
+            }.`,
+          });
         return;
       }
 
       if (raiseAmount <= 0 || raiseAmount > player.chips) {
-        io.to(playerId).emit("actionRejected", {
-          reason: "Invalid raise amount.",
-        });
+        if (callback)
+          callback({ success: false, error: "Invalid chip amount for raise." });
         return;
       }
 
       player.chips -= raiseAmount;
       player.currentBet = totalBet;
 
-      // NEW: Differentiate between a full raise and an incomplete one
+      // Differentiate between a full raise and an incomplete one
       const fullRaiseAmount = totalBet - room.minBet;
       if (!isAllIn && fullRaiseAmount >= minRaiseAmount) {
         // This is a full, legitimate raise
         room.lastRaiserIndex = playerIdx;
         room.lastRaise = fullRaiseAmount;
       } else {
-        // This is an incomplete all-in raise, it does NOT re-open the action.
-        // We do not update lastRaiserIndex.
+        // This is an incomplete all-in raise.
       }
 
       room.minBet = player.currentBet;
       if (player.chips <= 0) player.isAllIn = true;
       break;
     }
+    default:
+      if (callback)
+        callback({ success: false, error: `Unknown action: ${action}` });
+      return;
   }
 
   io.to(roomId).emit("playerActed", {
@@ -189,6 +243,8 @@ export function playerAction(roomId, playerId, action, amount = 0, io) {
   } else {
     advanceTurn(io, room);
   }
+
+  if (callback) callback({ success: true }); // <<< SUCCESS CALLBACK
 }
 
 // reconcilePots function remains the same...
@@ -279,6 +335,40 @@ function isBettingRoundComplete(room) {
   return false;
 }
 
+/** * Handles the game-ending condition (only one player remains with chips).
+ * Resets chips for all players and restarts the game.
+ */
+function endGameAndReset(roomId, io) {
+  const room = getRoom(roomId);
+  if (!room) return;
+
+  // Find the single winner (player with chips > 0)
+  const winner = room.players.find((p) => p.chips > 0);
+
+  // 1. Announce End of Game and Winner (LEADERBOARD)
+  io.to(roomId).emit("gameOver", {
+    winnerUsername: winner ? winner.username : "No Winner (all eliminated)",
+    message: winner
+      ? `${winner.username} wins the entire game! Starting Game 2...`
+      : "Game ended with no clear winner.",
+  });
+
+  // 2. Reset Chips for all non-disconnected players (The 1000 chip rule)
+  room.players.forEach((p) => {
+    if (!p.isDisconnected) {
+      // CRITICAL: Resets the winner's chips (and everyone else's) to 1000
+      p.chips = INITIAL_CHIPS;
+    }
+  });
+
+  console.log(
+    `Full game in Room ${roomId} ended. All players reset to ${INITIAL_CHIPS} chips.`
+  );
+
+  // 3. Start the new game (Game 2) after a delay
+  setTimeout(() => startGame(roomId, io), FULL_GAME_RESET_DELAY);
+}
+
 // nextRound function remains the same...
 function nextRound(io, room) {
   reconcilePots(room);
@@ -301,7 +391,13 @@ function nextRound(io, room) {
         ],
       });
     }
-    autoNextHand(room.id, io);
+
+    // CHECK FOR FULL GAME OVER
+    if (checkIfFullGameOver(room)) {
+      endGameAndReset(room.id, io);
+    } else {
+      autoNextHand(room.id, io);
+    }
     return;
   }
 
@@ -379,7 +475,12 @@ function showdown(io, room) {
     communityCards: room.communityCards,
   });
 
-  autoNextHand(room.id, io);
+  // CHECK FOR FULL GAME OVER
+  if (checkIfFullGameOver(room)) {
+    endGameAndReset(room.id, io);
+  } else {
+    autoNextHand(room.id, io);
+  }
 }
 
 function postBlind(player, amount, room) {

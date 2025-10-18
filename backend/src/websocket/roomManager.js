@@ -44,16 +44,21 @@ export function joinRoom(roomId, password) {
 
 /**
  * Handles a player leaving a room or disconnecting.
- * This function NOW SAFELY marks a player for removal without altering array indices mid-game.
+ * This function is DECOUPLED from Socket.IO and returns the status of the room.
+ * @param {string} roomId The ID of the room.
+ * @param {string} userId The persistent ID of the user.
+ * @returns {{roomDeleted: boolean} | {roomUpdated: boolean, room: object} | null}
  */
-export function leaveRoom(roomId, socketId, io) {
+export function leaveRoom(roomId, userId) {
   const room = rooms[roomId];
-  if (!room) return;
+  if (!room) return null;
 
-  const player = room.players.find((p) => p.id === socketId);
-  if (!player) return;
+  // FIX: Look up by persistent userId
+  const player = room.players.find((p) => p.userId === userId);
+  if (!player) return null;
 
-  console.log(`${player.username} has disconnected from room ${roomId}.`); // Mark as disconnected and fold. DO NOT remove from the array here. // The startGame() function will handle the actual cleanup between hands.
+  console.log(`${player.username} has disconnected from room ${roomId}.`);
+  // Mark as disconnected and fold.
   player.isDisconnected = true;
   player.hasFolded = true;
 
@@ -62,10 +67,12 @@ export function leaveRoom(roomId, socketId, io) {
   if (remainingPlayers.length === 0) {
     delete rooms[roomId];
     console.log(`Room ${roomId} deleted because it is empty.`);
+    // Room is deleted, tell socket.js to not broadcast an update
+    return { roomDeleted: true };
   } else {
-    // Notify other players of the disconnection.
-    io.to(roomId).emit("roomUpdate", roomSummary(room));
+    // Room is updated, tell socket.js to broadcast the new state
     room.lastActive = Date.now();
+    return { roomUpdated: true, room: roomSummary(room) };
   }
 }
 
@@ -77,8 +84,7 @@ export function getRoom(roomId) {
 }
 
 /**
- * NEW: Retrieves a list of public, joinable rooms.
- * This is used to display a room list on the frontend.
+ * Retrieves a list of public, joinable rooms.
  */
 export function getPublicRooms() {
   return Object.values(rooms)
@@ -92,8 +98,6 @@ export function getPublicRooms() {
 
 /**
  * Finds the index of the next player who can act, starting from a given index.
- * This correctly skips folded, all-in, and disconnected players.
- * NOTE: This can return null if no active players are found. The calling function must handle this.
  */
 export function findNextActiveIndexFrom(room, start) {
   if (!room.players || room.players.length === 0) return null;
@@ -140,6 +144,7 @@ export function roomSummary(room) {
     maxPlayers: room.maxPlayers,
     players: room.players.map((p) => ({
       id: p.id,
+      userId: p.userId, // Include userId for debugging/advanced frontend
       username: p.username,
       avatar: p.avatar,
       chips: p.chips,

@@ -3,15 +3,15 @@ import {
   joinRoom,
   leaveRoom,
   getRoom,
-  startRoomExpiryWatcher,
   roomSummary,
   getPublicRooms,
-} from "./roomManager.js";
-import { startGame, playerAction } from "../game/gameLogic.js";
+} from "./room_manager.js";
+import { startGame, playerAction } from "../game/game_logic.js";
 import { getRandomAvatar } from "../utils/avatar.js";
+import jwt from "jsonwebtoken"; // REQUIRED for token decoding
 
-// Start room expiry watcher (30 minutes)
-startRoomExpiryWatcher(30 * 60 * 1000);
+// NOTE: The redundant call to startRoomExpiryWatcher(30 * 60 * 1000)
+// has been removed from this file. It should only run once in server.js.
 
 export const initSockets = (io) => {
   io.on("connection", (socket) => {
@@ -29,18 +29,34 @@ export const initSockets = (io) => {
     });
 
     // Create a new Room
-    socket.on("createRoom", (data, callback) => {
+    socket.on("createRoom", async (data, callback) => {
       try {
+        const { username, avatar, token, region, maxPlayers, password } = data;
+
+        let userId;
+        try {
+          const decoded = jwt.verify(token, process.env.JWT_SECRET);
+          userId = decoded.id;
+        } catch (err) {
+          if (callback)
+            callback({
+              success: false,
+              error: "Authentication failed: Invalid token.",
+            });
+          return;
+        }
+
         const room = createRoom({
-          region: data.region || "IN",
-          maxPlayers: data.maxPlayers || 5,
-          password: data.password || "",
+          region: region || "IN",
+          maxPlayers: maxPlayers || 5,
+          password: password || "",
         });
 
         const player = {
-          id: socket.id,
-          username: data.username || "Host",
-          avatar: data.avatar || getRandomAvatar(),
+          id: socket.id, // Ephemeral Socket ID
+          userId: userId, // Persistent User ID
+          username: username || "Host",
+          avatar: avatar || getRandomAvatar(),
           chips: 1000,
           isDisconnected: false,
         };
@@ -48,9 +64,12 @@ export const initSockets = (io) => {
         room.players.push(player);
         socket.join(room.id);
         socket.data.roomId = room.id;
+        socket.data.userId = userId;
 
         if (callback) callback({ success: true, roomId: room.id });
-        io.to(room.id).emit("roomUpdate", roomSummary(room));
+
+        // Broadcast to all connected clients that the lobby has updated
+        io.emit("lobbyUpdate", getPublicRooms());
       } catch (err) {
         console.error("CreateRoom Error:", err);
         if (callback) callback({ success: false, error: err.message });
@@ -58,32 +77,56 @@ export const initSockets = (io) => {
     });
 
     // Join an existing Room
-    socket.on("joinRoom", (data, callback) => {
+    socket.on("joinRoom", async (data, callback) => {
       try {
-        const room = joinRoom(data.roomId, data.password || "");
-        let player = room.players.find((p) => p.id === socket.id);
+        const { roomId, password, token, username, avatar } = data;
+
+        let userId;
+        try {
+          const decoded = jwt.verify(token, process.env.JWT_SECRET);
+          userId = decoded.id;
+        } catch (err) {
+          if (callback)
+            callback({
+              success: false,
+              error: "Authentication required or failed.",
+            });
+          return;
+        }
+
+        const room = joinRoom(roomId, password || "");
+
+        // CRITICAL FIX: Find player by persistent userId, not socket.id!
+        let player = room.players.find((p) => p.userId === userId);
         let isReconnecting = true;
 
         if (player) {
-          // Player is reconnecting
+          // Player is reconnecting: Update their ephemeral socket ID
+          player.id = socket.id;
           player.isDisconnected = false;
         } else {
           // New player is joining
           isReconnecting = false;
           player = {
             id: socket.id,
-            username: data.username || `Player-${socket.id.slice(0, 5)}`,
-            avatar: data.avatar || getRandomAvatar(),
+            userId: userId, // STORE PERSISTENT ID
+            username: username || `Player-${userId.slice(-5)}`,
+            avatar: avatar || getRandomAvatar(),
             chips: 1000,
             isDisconnected: false,
           };
           room.players.push(player);
         }
+
         socket.join(room.id);
         socket.data.roomId = room.id;
+        socket.data.userId = userId; // Store persistent ID on socket data
 
         if (callback) callback({ success: true, room: roomSummary(room) });
+
+        // Broadcast to players in the room and update the global lobby list
         io.to(room.id).emit("roomUpdate", roomSummary(room));
+        io.emit("lobbyUpdate", getPublicRooms());
 
         // Send a system message to the chat when a new player joins
         if (!isReconnecting) {
@@ -111,7 +154,8 @@ export const initSockets = (io) => {
         return;
       }
 
-      const player = room.players.find((p) => p.id === socket.id);
+      // Lookup player by persistent userId (more reliable)
+      const player = room.players.find((p) => p.userId === socket.data.userId);
       if (!player) {
         if (callback) callback({ success: false, error: "Player not found." });
         return;
@@ -124,7 +168,7 @@ export const initSockets = (io) => {
       }
 
       const messageData = {
-        type: "player", // Differentiate player messages from system messages
+        type: "player",
         senderId: player.id,
         username: player.username,
         avatar: player.avatar,
@@ -141,10 +185,14 @@ export const initSockets = (io) => {
     socket.on("startGame", (payload, callback) => {
       const roomId = socket.data.roomId;
       const room = getRoom(roomId);
-      if (!room) return;
+      if (!room) {
+        if (callback) callback({ success: false, error: "Room not found." });
+        return;
+      }
 
       // Validation: Only the host (first player) can start
-      if (room.players[0].id !== socket.id) {
+      const hostId = room.players[0]?.id;
+      if (hostId !== socket.id) {
         if (callback)
           callback({
             success: false,
@@ -152,6 +200,7 @@ export const initSockets = (io) => {
           });
         return;
       }
+
       // Validation: Can't start a game that's already in progress
       if (room.deck && room.deck.length > 0) {
         if (callback)
@@ -167,28 +216,47 @@ export const initSockets = (io) => {
     socket.on("playerAction", (payload, callback) => {
       const roomId = socket.data.roomId;
       const room = getRoom(roomId);
-      if (!room || !payload?.action) return;
+
+      if (!room || !payload?.action) {
+        if (callback)
+          callback({
+            success: false,
+            error: "Invalid room or action payload.",
+          });
+        return;
+      }
 
       // Validation: Player can only act on their turn
       const currentPlayer = room.players[room.currentPlayerIndex];
+      // Check turn using the current ephemeral socket.id
       if (!currentPlayer || currentPlayer.id !== socket.id) {
         if (callback)
           callback({ success: false, error: "It's not your turn." });
         return;
       }
 
-      playerAction(roomId, socket.id, payload.action, payload.amount || 0, io);
-      if (callback) callback({ success: true });
+      // Pass the callback so gameLogic can report back explicit errors (Fix C)
+      playerAction(
+        roomId,
+        socket.id,
+        payload.action,
+        payload.amount || 0,
+        io,
+        callback
+      );
     });
 
     // Handle Player Disconnection
     socket.on("disconnect", () => {
       const roomId = socket.data.roomId;
+      const userId = socket.data.userId; // Use the persistent ID if available
+
       if (roomId) {
         const room = getRoom(roomId);
         if (room) {
-          const player = room.players.find((p) => p.id === socket.id);
-          // Send a system message if a known player disconnects
+          // Look up player using persistent userId for robust messaging
+          const player = room.players.find((p) => p.userId === userId);
+
           if (player && !player.isDisconnected) {
             const systemMessage = {
               type: "system",
@@ -198,7 +266,9 @@ export const initSockets = (io) => {
             io.to(roomId).emit("newMessage", systemMessage);
           }
         }
-        leaveRoom(roomId, socket.id, io);
+
+        // leaveRoom is updated to handle cleanup and trigger lobby updates
+        leaveRoom(roomId, userId, io);
       }
       console.log("Player disconnected:", socket.id);
     });
