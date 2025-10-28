@@ -4,8 +4,8 @@ import {
   dealHoleCards,
   dealCommunityCards,
   determineWinners,
-} from "./game_utils.js";
-import { getRoom, findNextActiveIndexFrom } from "../websocket/room_manager.js";
+} from "./gameUtils.js";
+import { getRoom, findNextActiveIndexFrom } from "../websocket/roomManager.js";
 
 const AUTO_NEXT_HAND_DELAY = 7000; // Delay for regular hand restart
 const FULL_GAME_RESET_DELAY = 10000; // Longer delay to announce winner before reset

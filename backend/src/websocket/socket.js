@@ -5,46 +5,68 @@ import {
   getRoom,
   roomSummary,
   getPublicRooms,
-} from "./room_manager.js";
-import { startGame, playerAction } from "../game/game_logic.js";
+} from "./roomManager.js";
+import { startGame, playerAction } from "../game/gameLogic.js";
 import { getRandomAvatar } from "../utils/avatar.js";
-import jwt from "jsonwebtoken"; // REQUIRED for token decoding
+import jwt from "jsonwebtoken";
+import User from "../models/user.js"; // ✅ Make sure this exists and points to your user model
 
-// NOTE: The redundant call to startRoomExpiryWatcher(30 * 60 * 1000)
-// has been removed from this file. It should only run once in server.js.
-
+// =====================================================
+//  SOCKET INITIALIZATION WITH AUTH MIDDLEWARE
+// =====================================================
 export const initSockets = (io) => {
-  io.on("connection", (socket) => {
-    console.log("Player connected:", socket.id);
+  // ✅ AUTHENTICATION MIDDLEWARE (runs BEFORE connection event)
+  io.use(async (socket, next) => {
+    const token = socket.handshake.auth?.token;
+    if (!token) {
+      return next(new Error("Authentication error: No token provided."));
+    }
 
-    // Get Public Room List
+    try {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const user = await User.findById(decoded.id).select("-password");
+      if (!user) {
+        return next(new Error("Authentication error: User not found."));
+      }
+
+      socket.user = {
+        id: user._id.toString(),
+        username: user.username,
+        avatar: user.avatar || getRandomAvatar(),
+      };
+
+      next();
+    } catch (err) {
+      console.error("Socket Auth Error:", err.message);
+      next(new Error("Authentication error: Invalid token."));
+    }
+  });
+
+  // =====================================================
+  //  CONNECTION HANDLER
+  // =====================================================
+  io.on("connection", (socket) => {
+    console.log(`✅ Player connected: ${socket.user.username} (${socket.id})`);
+
+    // =====================================================
+    //  GET ROOM LIST
+    // =====================================================
     socket.on("getRoomList", (callback) => {
       try {
         const rooms = getPublicRooms();
-        if (callback) callback({ success: true, rooms });
+        callback?.({ success: true, rooms });
       } catch (err) {
         console.error("GetRoomList Error:", err);
-        if (callback) callback({ success: false, error: err.message });
+        callback?.({ success: false, error: err.message });
       }
     });
 
-    // Create a new Room
+    // =====================================================
+    //  CREATE ROOM
+    // =====================================================
     socket.on("createRoom", async (data, callback) => {
       try {
-        const { username, avatar, token, region, maxPlayers, password } = data;
-
-        let userId;
-        try {
-          const decoded = jwt.verify(token, process.env.JWT_SECRET);
-          userId = decoded.id;
-        } catch (err) {
-          if (callback)
-            callback({
-              success: false,
-              error: "Authentication failed: Invalid token.",
-            });
-          return;
-        }
+        const { region, maxPlayers, password } = data;
 
         const room = createRoom({
           region: region || "IN",
@@ -53,10 +75,10 @@ export const initSockets = (io) => {
         });
 
         const player = {
-          id: socket.id, // Ephemeral Socket ID
-          userId: userId, // Persistent User ID
-          username: username || "Host",
-          avatar: avatar || getRandomAvatar(),
+          id: socket.id,
+          userId: socket.user.id,
+          username: socket.user.username,
+          avatar: socket.user.avatar,
           chips: 1000,
           isDisconnected: false,
         };
@@ -64,54 +86,37 @@ export const initSockets = (io) => {
         room.players.push(player);
         socket.join(room.id);
         socket.data.roomId = room.id;
-        socket.data.userId = userId;
+        socket.data.userId = socket.user.id;
 
-        if (callback) callback({ success: true, roomId: room.id });
-
-        // Broadcast to all connected clients that the lobby has updated
+        callback?.({ success: true, roomId: room.id });
         io.emit("lobbyUpdate", getPublicRooms());
       } catch (err) {
         console.error("CreateRoom Error:", err);
-        if (callback) callback({ success: false, error: err.message });
+        callback?.({ success: false, error: err.message });
       }
     });
 
-    // Join an existing Room
-    socket.on("joinRoom", async (data, callback) => {
+    // =====================================================
+    //  JOIN ROOM
+    // =====================================================
+    socket.on("joinRoom", (data, callback) => {
       try {
-        const { roomId, password, token, username, avatar } = data;
-
-        let userId;
-        try {
-          const decoded = jwt.verify(token, process.env.JWT_SECRET);
-          userId = decoded.id;
-        } catch (err) {
-          if (callback)
-            callback({
-              success: false,
-              error: "Authentication required or failed.",
-            });
-          return;
-        }
+        const { roomId, password } = data;
 
         const room = joinRoom(roomId, password || "");
-
-        // CRITICAL FIX: Find player by persistent userId, not socket.id!
-        let player = room.players.find((p) => p.userId === userId);
+        let player = room.players.find((p) => p.userId === socket.user.id);
         let isReconnecting = true;
 
         if (player) {
-          // Player is reconnecting: Update their ephemeral socket ID
           player.id = socket.id;
           player.isDisconnected = false;
         } else {
-          // New player is joining
           isReconnecting = false;
           player = {
             id: socket.id,
-            userId: userId, // STORE PERSISTENT ID
-            username: username || `Player-${userId.slice(-5)}`,
-            avatar: avatar || getRandomAvatar(),
+            userId: socket.user.id,
+            username: socket.user.username,
+            avatar: socket.user.avatar,
             chips: 1000,
             isDisconnected: false,
           };
@@ -120,15 +125,13 @@ export const initSockets = (io) => {
 
         socket.join(room.id);
         socket.data.roomId = room.id;
-        socket.data.userId = userId; // Store persistent ID on socket data
+        socket.data.userId = socket.user.id;
 
-        if (callback) callback({ success: true, room: roomSummary(room) });
+        callback?.({ success: true, room: roomSummary(room) });
 
-        // Broadcast to players in the room and update the global lobby list
         io.to(room.id).emit("roomUpdate", roomSummary(room));
         io.emit("lobbyUpdate", getPublicRooms());
 
-        // Send a system message to the chat when a new player joins
         if (!isReconnecting) {
           const systemMessage = {
             type: "system",
@@ -139,32 +142,25 @@ export const initSockets = (io) => {
         }
       } catch (err) {
         console.error("JoinRoom Error:", err);
-        if (callback) callback({ success: false, error: err.message });
+        callback?.({ success: false, error: err.message });
       }
     });
 
-    // Handle Chat Messages
+    // =====================================================
+    //  CHAT MESSAGE
+    // =====================================================
     socket.on("sendMessage", (message, callback) => {
       const roomId = socket.data.roomId;
       const room = getRoom(roomId);
 
-      if (!room) {
-        if (callback)
-          callback({ success: false, error: "You are not in a room." });
-        return;
-      }
+      if (!room) return callback?.({ success: false, error: "No room found." });
 
-      // Lookup player by persistent userId (more reliable)
       const player = room.players.find((p) => p.userId === socket.data.userId);
-      if (!player) {
-        if (callback) callback({ success: false, error: "Player not found." });
-        return;
-      }
+      if (!player)
+        return callback?.({ success: false, error: "Player not found." });
 
-      if (!message || typeof message !== "string" || message.trim() === "") {
-        if (callback)
-          callback({ success: false, error: "Message cannot be empty." });
-        return;
+      if (!message || typeof message !== "string" || !message.trim()) {
+        return callback?.({ success: false, error: "Empty message." });
       }
 
       const messageData = {
@@ -177,65 +173,53 @@ export const initSockets = (io) => {
       };
 
       io.to(roomId).emit("newMessage", messageData);
-
-      if (callback) callback({ success: true });
+      callback?.({ success: true });
     });
 
-    // Start the Game
+    // =====================================================
+    //  START GAME
+    // =====================================================
     socket.on("startGame", (payload, callback) => {
       const roomId = socket.data.roomId;
       const room = getRoom(roomId);
-      if (!room) {
-        if (callback) callback({ success: false, error: "Room not found." });
-        return;
-      }
 
-      // Validation: Only the host (first player) can start
+      if (!room)
+        return callback?.({ success: false, error: "Room not found." });
       const hostId = room.players[0]?.id;
-      if (hostId !== socket.id) {
-        if (callback)
-          callback({
-            success: false,
-            error: "Only the host can start the game.",
-          });
-        return;
-      }
 
-      // Validation: Can't start a game that's already in progress
-      if (room.deck && room.deck.length > 0) {
-        if (callback)
-          callback({ success: false, error: "A game is already in progress." });
-        return;
-      }
+      if (hostId !== socket.id)
+        return callback?.({
+          success: false,
+          error: "Only the host can start the game.",
+        });
+
+      if (room.deck && room.deck.length > 0)
+        return callback?.({
+          success: false,
+          error: "A game is already in progress.",
+        });
 
       startGame(roomId, io);
-      if (callback) callback({ success: true });
+      callback?.({ success: true });
     });
 
-    // Handle a Player's Action (Fold, Call, Raise)
+    // =====================================================
+    //  PLAYER ACTION
+    // =====================================================
     socket.on("playerAction", (payload, callback) => {
       const roomId = socket.data.roomId;
       const room = getRoom(roomId);
 
-      if (!room || !payload?.action) {
-        if (callback)
-          callback({
-            success: false,
-            error: "Invalid room or action payload.",
-          });
-        return;
-      }
+      if (!room || !payload?.action)
+        return callback?.({
+          success: false,
+          error: "Invalid room or action payload.",
+        });
 
-      // Validation: Player can only act on their turn
       const currentPlayer = room.players[room.currentPlayerIndex];
-      // Check turn using the current ephemeral socket.id
-      if (!currentPlayer || currentPlayer.id !== socket.id) {
-        if (callback)
-          callback({ success: false, error: "It's not your turn." });
-        return;
-      }
+      if (!currentPlayer || currentPlayer.id !== socket.id)
+        return callback?.({ success: false, error: "It's not your turn." });
 
-      // Pass the callback so gameLogic can report back explicit errors (Fix C)
       playerAction(
         roomId,
         socket.id,
@@ -246,15 +230,16 @@ export const initSockets = (io) => {
       );
     });
 
-    // Handle Player Disconnection
+    // =====================================================
+    //  DISCONNECT HANDLER
+    // =====================================================
     socket.on("disconnect", () => {
       const roomId = socket.data.roomId;
-      const userId = socket.data.userId; // Use the persistent ID if available
+      const userId = socket.data.userId;
 
       if (roomId) {
         const room = getRoom(roomId);
         if (room) {
-          // Look up player using persistent userId for robust messaging
           const player = room.players.find((p) => p.userId === userId);
 
           if (player && !player.isDisconnected) {
@@ -267,10 +252,10 @@ export const initSockets = (io) => {
           }
         }
 
-        // leaveRoom is updated to handle cleanup and trigger lobby updates
         leaveRoom(roomId, userId, io);
       }
-      console.log("Player disconnected:", socket.id);
+
+      console.log(`❌ Player disconnected: ${socket.user.username}`);
     });
   });
 };
