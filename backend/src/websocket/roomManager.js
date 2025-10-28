@@ -44,9 +44,13 @@ export function joinRoom(roomId, password) {
 
 /**
  * Handles a player leaving a room or disconnecting.
+ * This function is DECOUPLED from Socket.IO and returns the status of the room.
+ * @param {string} roomId The ID of the room.
+ * @param {string} userId The persistent ID of the user.
+ * @returns {{roomDeleted: boolean} | {roomUpdated: boolean, room: object} | null}
  */
 export function leaveRoom(roomId, userId, io) {
-  // Added io to pass to roomSummary if needed
+  // Added io
   const room = rooms[roomId];
   if (!room) return null;
 
@@ -62,12 +66,11 @@ export function leaveRoom(roomId, userId, io) {
   if (remainingPlayers.length === 0) {
     delete rooms[roomId];
     console.log(`Room ${roomId} deleted because it is empty.`);
-    // --- FIX: Broadcast lobby update AFTER deleting the room ---
-    io.emit("lobbyUpdate", getPublicRooms());
+    io.emit("lobbyUpdate", getPublicRooms()); // Broadcast update
     return { roomDeleted: true };
   } else {
     room.lastActive = Date.now();
-    // --- FIX: Broadcast updates on disconnect ---
+    // Broadcast updates
     io.to(room.id).emit("roomUpdate", roomSummary(room));
     io.emit("lobbyUpdate", getPublicRooms());
     return { roomUpdated: true, room: roomSummary(room) };
@@ -88,10 +91,10 @@ export function getPublicRooms() {
   return Object.values(rooms)
     .filter((room) => {
       const activeCount = room.players.filter((p) => !p.isDisconnected).length;
-      // --- FIX: Show ALL rooms that are not full, regardless of password ---
+      // FIX: Show ALL rooms that are not full
       return activeCount < room.maxPlayers;
     })
-    .map((room) => roomSummary(room)); // Use the existing summary function for safety
+    .map((room) => roomSummary(room));
 }
 
 /**
@@ -118,22 +121,24 @@ export function findNextActiveIndexFrom(room, start) {
 
 /**
  * Periodically cleans up inactive rooms.
+ * NOTE: This function needs the 'io' instance to broadcast updates.
+ * Make sure to pass 'io' from server.js when you call this.
  */
-export function startRoomExpiryWatcher(timeoutMs = 30 * 60 * 1000) {
+export function startRoomExpiryWatcher(io, timeoutMs = 30 * 60 * 1000) {
   setInterval(() => {
     const now = Date.now();
+    let lobbyUpdated = false;
     for (const [id, room] of Object.entries(rooms)) {
       if (now - room.lastActive > timeoutMs) {
         console.log(`Room ${id} expired and removed due to inactivity`);
         delete rooms[id];
-        // --- FIX: Broadcast lobby update when a room expires ---
-        // Note: This needs the 'io' instance. This function is called from server.js,
-        // so you should pass 'io' to it from there.
-        // For now, this fix assumes 'io' is not available here,
-        // but the 'leaveRoom' fix will handle most cases.
+        lobbyUpdated = true;
       }
     }
-  }, 60 * 1000);
+    if (lobbyUpdated) {
+      io.emit("lobbyUpdate", getPublicRooms()); // Broadcast update
+    }
+  }, 60 * 1000); // Check every minute
 }
 
 /**
@@ -141,19 +146,31 @@ export function startRoomExpiryWatcher(timeoutMs = 30 * 60 * 1000) {
  */
 export function roomSummary(room) {
   if (!room) return {};
+
+  // --- FIX: Find the host's name ---
+  // The host is always the first player in the players array (index 0)
+  const host = room.players[0];
+  const hostName = host ? host.username : "Unknown"; // Fallback
+  // --- END FIX ---
+
   return {
     id: room.id,
     region: room.region,
     maxPlayers: room.maxPlayers,
-    // --- FIX: Tell the frontend if a password is set ---
     hasPassword: !!room.password,
-    players: room.players.map((p) => ({
-      id: p.id,
-      userId: p.userId,
-      username: p.username,
-      avatar: p.avatar,
-      chips: p.chips,
-      isDisconnected: !!p.isDisconnected,
-    })),
+    host: hostName, // --- FIX: Add host name to the summary ---
+
+    // Return player count instead of the full array for lobby summary
+    players: room.players.filter((p) => !p.isDisconnected).length,
+
+    // --- OR send full player data if lobby needs it (choose one) ---
+    // players: room.players.map((p) => ({
+    //     id: p.id,
+    //     userId: p.userId,
+    //     username: p.username,
+    //     avatar: p.avatar,
+    //     chips: p.chips,
+    //     isDisconnected: !!p.isDisconnected,
+    // })),
   };
 }
