@@ -33,8 +33,15 @@ export function joinRoom(roomId, password) {
   if (room.password && room.password !== password)
     throw new Error("Invalid password");
 
+  // Check if player is already in room (but disconnected)
+  // This logic is handled in socket.js, but we check for max players here.
+  // ... existing code ...
   const activeCount = room.players.filter((p) => !p.isDisconnected).length;
   if (activeCount >= room.maxPlayers) {
+    // Check if the user trying to join is one of the disconnected players
+    // Note: This logic is primarily in socket.js's joinRoom.
+    // We'll assume socket.js handles the re-connect logic vs. new player logic.
+    // This is just a safeguard.
     throw new Error(`Room is full (max ${room.maxPlayers} players).`);
   }
 
@@ -59,7 +66,7 @@ export function leaveRoom(roomId, userId, io) {
 
   console.log(`${player.username} has disconnected from room ${roomId}.`);
   player.isDisconnected = true;
-  player.hasFolded = true;
+  player.hasFolded = true; // Ensure they are folded if they were in a hand
 
   const remainingPlayers = room.players.filter((p) => !p.isDisconnected);
 
@@ -70,9 +77,28 @@ export function leaveRoom(roomId, userId, io) {
     return { roomDeleted: true };
   } else {
     room.lastActive = Date.now();
-    // Broadcast updates
-    io.to(room.id).emit("roomUpdate", roomSummary(room));
-    io.emit("lobbyUpdate", getPublicRooms());
+
+    // --- FIX: Create the correct payload for the game room ---
+    // This payload includes the full player list, which the
+    // "Waiting" screen needs to re-render.
+    const gameRoomPayload = {
+      id: room.id,
+      players: room.players.map((p) => ({
+        id: p.id,
+        userId: p.userId,
+        username: p.username,
+        avatar: p.avatar,
+        chips: p.chips,
+        isDisconnected: p.isDisconnected,
+      })),
+      hostId: room.players[0]?.userId || null,
+    }; // Broadcast updates
+    // --- END FIX ---
+
+    // --- FIX: Send the correct payload to the correct rooms ---
+    io.to(room.id).emit("roomUpdate", gameRoomPayload); // Send full details to the game room
+    io.emit("lobbyUpdate", getPublicRooms()); // Send lobby summary to the lobby
+    // --- END FIX ---
     return { roomUpdated: true, room: roomSummary(room) };
   }
 }
@@ -91,7 +117,6 @@ export function getPublicRooms() {
   return Object.values(rooms)
     .filter((room) => {
       const activeCount = room.players.filter((p) => !p.isDisconnected).length;
-      // FIX: Show ALL rooms that are not full
       return activeCount < room.maxPlayers;
     })
     .map((room) => roomSummary(room));
@@ -142,35 +167,22 @@ export function startRoomExpiryWatcher(io, timeoutMs = 30 * 60 * 1000) {
 }
 
 /**
- * Returns a summary of a room, safe to send to clients.
+ * Returns a summary of a room, safe to send to clients (for the lobby).
  */
 export function roomSummary(room) {
-  if (!room) return {};
+  if (!room) return {}; // The host is always the first player in the players array (index 0)
 
-  // --- FIX: Find the host's name ---
-  // The host is always the first player in the players array (index 0)
   const host = room.players[0];
   const hostName = host ? host.username : "Unknown"; // Fallback
-  // --- END FIX ---
 
   return {
     id: room.id,
     region: room.region,
     maxPlayers: room.maxPlayers,
     hasPassword: !!room.password,
-    host: hostName, // --- FIX: Add host name to the summary ---
+    host: hostName, // Return player count for the lobby summary
 
-    // Return player count instead of the full array for lobby summary
     players: room.players.filter((p) => !p.isDisconnected).length,
-
-    // --- OR send full player data if lobby needs it (choose one) ---
-    // players: room.players.map((p) => ({
-    //     id: p.id,
-    //     userId: p.userId,
-    //     username: p.username,
-    //     avatar: p.avatar,
-    //     chips: p.chips,
-    //     isDisconnected: !!p.isDisconnected,
-    // })),
+    s, // Note: Full player list is sent separately for the game room // in socket.js and leaveRoom()
   };
 }

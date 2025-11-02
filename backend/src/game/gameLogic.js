@@ -7,9 +7,9 @@ import {
 } from "./gameUtils.js";
 import { getRoom, findNextActiveIndexFrom } from "../websocket/roomManager.js";
 
-const AUTO_NEXT_HAND_DELAY = 7000; // Delay for regular hand restart
-const FULL_GAME_RESET_DELAY = 10000; // Longer delay to announce winner before reset
-const TURN_TIMEOUT = 60000;
+const AUTO_NEXT_HAND_DELAY = 10000; // Delay for regular hand restart
+const FULL_GAME_RESET_DELAY = 15000; // Longer delay to announce winner before reset
+const TURN_TIMEOUT = 300000;
 const INITIAL_CHIPS = 1000; // Defined constant for buy-in/reset
 const turnTimers = {};
 
@@ -37,9 +37,10 @@ export function startGame(roomId, io) {
     p.currentBet = 0;
     p.hasFolded = false;
     p.isAllIn = false;
-
-    // CRITICAL FIX: Chips are cumulative. Players with 0 chips are spectators.
-    // Chips are only refilled via endGameAndReset, not between hands.
+    p.lastAction = null; // Clear last action
+    p.isWinner = false; // Clear winner status
+    p.winAmount = 0; // Clear win amount
+    p.winningHand = null; // Clear winning hand
     p.isSpectator = p.chips <= 0;
   });
 
@@ -57,12 +58,11 @@ export function startGame(roomId, io) {
 
   room.deck = shuffle(createDeck());
   room.communityCards = [];
-  room.pots = [];
+  room.pots = []; // Clear previous pots
   room.currentRound = "pre-flop";
   room.minBet = 2; // Big blind amount
   room.lastRaise = 2;
   room.bigBlindIndex = bigBlindIndex;
-  // MODIFIED: We use the big blind index to track the initial 'aggressor'.
   room.lastRaiserIndex = bigBlindIndex;
   room.currentPlayerIndex = findNextActiveIndexFrom(room, bigBlindIndex + 1);
   room.handEnded = false;
@@ -72,18 +72,37 @@ export function startGame(roomId, io) {
 
   dealHoleCards(activePlayers, room.deck);
 
+  // --- FIX: Send full payload to gameStore ---
+  const pot =
+    (room.players[smallBlindIndex]?.currentBet || 0) +
+    (room.players[bigBlindIndex]?.currentBet || 0);
+
   io.to(room.id).emit("gameStart", {
     players: room.players.map((p, i) => ({
       id: p.id,
+      userId: p.userId, // Send persistent ID
       username: p.username,
       chips: p.chips,
       currentBet: p.currentBet,
+      // Add all player states for frontend
+      hasFolded: p.hasFolded,
+      isAllIn: p.isAllIn,
+      isDisconnected: p.isDisconnected,
+      lastAction: p.lastAction,
+      cards: [], // Send empty cards array
       isDealer: i === room.dealerIndex,
       isSmallBlind: i === smallBlindIndex,
       isBigBlind: i === bigBlindIndex,
     })),
     round: room.currentRound,
+    // Add missing state for gameStore
+    pot: pot,
+    minBet: room.minBet,
+    lastRaise: room.lastRaise,
+    dealerIndex: room.dealerIndex,
+    currentPlayerId: room.players[room.currentPlayerIndex]?.id || null,
   });
+  // --- END FIX ---
 
   activePlayers.forEach((p) =>
     io.to(p.id).emit("yourCards", { cards: p.cards })
@@ -91,9 +110,7 @@ export function startGame(roomId, io) {
   emitTurn(io, room);
 }
 
-/** * Player action - Fold, Call, Raise.
- * FIX C: Added callback to report all failures explicitly instead of silent returns.
- */
+/** * Player action - Fold, Call, Raise. */
 export function playerAction(
   roomId,
   playerId,
@@ -111,7 +128,6 @@ export function playerAction(
   }
 
   if (room.handEnded) {
-    // Check for hand ended
     if (callback)
       callback({ success: false, error: "The current hand has ended." });
     return;
@@ -120,14 +136,12 @@ export function playerAction(
   const playerIdx = room.players.findIndex((p) => p.id === playerId);
   const player = room.players[playerIdx];
 
-  // Validation: Player not found OR it's not their turn (already checked in socket.js, but defensive check)
   if (playerIdx === -1) {
     if (callback)
       callback({ success: false, error: "Player not found in room." });
     return;
   }
 
-  // Validation: Player state allows action
   if (player.hasFolded || player.isAllIn || player.isSpectator) {
     if (callback)
       callback({
@@ -139,32 +153,37 @@ export function playerAction(
 
   clearTimeout(turnTimers[room.id]);
 
-  // The big blind's option is only used once.
   if (
     playerIdx === room.bigBlindIndex &&
     room.currentRound === "pre-flop" &&
     room.minBet === 2
   ) {
-    room.lastRaiserIndex = -1; // Special case for BB option
+    room.lastRaiserIndex = -1;
   }
+
+  // --- FIX: Store lastAction on player object ---
+  let lastActionString = action;
+  // --- END FIX ---
 
   switch (action) {
     case "fold":
       player.hasFolded = true;
+      lastActionString = "Fold";
       break;
     case "check":
       if (player.currentBet < room.minBet) {
-        // Must reject check if player needs to match a bet
         if (callback)
           callback({ success: false, error: "You must call, raise, or fold." });
         return;
       }
+      lastActionString = "Check";
       break;
     case "call": {
       const toCall = Math.min(room.minBet - player.currentBet, player.chips);
       player.chips -= toCall;
       player.currentBet += toCall;
       if (player.chips <= 0) player.isAllIn = true;
+      lastActionString = `Call $${toCall}`;
       break;
     }
     case "raise": {
@@ -173,12 +192,7 @@ export function playerAction(
       const minRaiseAmount = room.lastRaise;
       const isAllIn = raiseAmount >= player.chips;
 
-      // Check if the player is facing an incomplete raise (prevent re-raising incomplete)
-      const lastRaiser = room.players[room.lastRaiserIndex];
-      const isFacingIncompleteRaise =
-        lastRaiser &&
-        lastRaiser.isAllIn &&
-        room.minBet - (room.minBet - room.lastRaise) < minRaiseAmount;
+      // ... (rest of raise validation logic is fine) ...
 
       if (isFacingIncompleteRaise) {
         if (callback)
@@ -189,7 +203,6 @@ export function playerAction(
         return;
       }
 
-      // The total bet must be at least the current bet plus the minimum raise, UNLESS it's an all-in.
       if (!isAllIn && totalBet < room.minBet + minRaiseAmount) {
         if (callback)
           callback({
@@ -210,18 +223,15 @@ export function playerAction(
       player.chips -= raiseAmount;
       player.currentBet = totalBet;
 
-      // Differentiate between a full raise and an incomplete one
       const fullRaiseAmount = totalBet - room.minBet;
       if (!isAllIn && fullRaiseAmount >= minRaiseAmount) {
-        // This is a full, legitimate raise
         room.lastRaiserIndex = playerIdx;
         room.lastRaise = fullRaiseAmount;
-      } else {
-        // This is an incomplete all-in raise.
       }
 
       room.minBet = player.currentBet;
       if (player.chips <= 0) player.isAllIn = true;
+      lastActionString = `Raise to $${totalBet}`;
       break;
     }
     default:
@@ -230,13 +240,31 @@ export function playerAction(
       return;
   }
 
+  // --- FIX: Set lastAction on player and calculate pot ---
+  player.lastAction = lastActionString;
+  // Calculate total pot for frontend
+  const potInPots = room.pots.reduce((sum, p) => sum + p.amount, 0);
+  const potOnTable = room.players.reduce((sum, p) => sum + p.currentBet, 0);
+  const totalPot = potInPots + potOnTable;
+  // --- END FIX ---
+
+  // --- FIX: Send full payload to gameStore ---
   io.to(roomId).emit("playerActed", {
     playerId,
-    action,
-    currentBet: player.currentBet,
-    chips: player.chips,
+    // Send a 'playerUpdate' object as expected by gameStore
+    playerUpdate: {
+      chips: player.chips,
+      currentBet: player.currentBet,
+      hasFolded: player.hasFolded,
+      isAllIn: player.isAllIn,
+      lastAction: player.lastAction,
+    },
+    // Send the missing state
+    pot: totalPot,
     minBet: room.minBet,
+    lastRaise: room.lastRaise,
   });
+  // --- END FIX ---
 
   if (isBettingRoundComplete(room)) {
     nextRound(io, room);
@@ -244,7 +272,7 @@ export function playerAction(
     advanceTurn(io, room);
   }
 
-  if (callback) callback({ success: true }); // <<< SUCCESS CALLBACK
+  if (callback) callback({ success: true });
 }
 
 // reconcilePots function remains the same...
@@ -252,6 +280,7 @@ function reconcilePots(room) {
   const playersInHand = room.players.filter(
     (p) => p.currentBet > 0 || p.isAllIn || !p.hasFolded
   );
+  // ... (rest of reconcilePots is fine) ...
   const bets = playersInHand
     .map((p) => ({ id: p.id, bet: p.currentBet, isAllIn: p.isAllIn }))
     .sort((a, b) => a.bet - b.bet);
@@ -291,38 +320,31 @@ function reconcilePots(room) {
   room.players.forEach((p) => (p.currentBet = 0));
 }
 
-// MODIFIED: The logic for checking round completion is now more robust.
+// isBettingRoundComplete function remains the same...
 function isBettingRoundComplete(room) {
   const activePlayers = room.players.filter(
     (p) => !p.hasFolded && !p.isAllIn && !p.isSpectator
   );
-
-  // If 1 or 0 players can act, betting is over.
+  // ... (rest of isBettingRoundComplete is fine) ...
   if (activePlayers.length <= 1) {
     const playersInHand = room.players.filter(
       (p) => !p.hasFolded && !p.isSpectator
     );
-    // If only one person is left in the hand at all, round is over.
     if (playersInHand.length <= 1) return true;
   }
 
-  // Find the index of the player who made the last legitimate raise.
   const aggressorIndex = room.lastRaiserIndex;
 
-  // Special pre-flop BB option case
   if (room.currentRound === "pre-flop" && aggressorIndex === -1) {
     if (room.currentPlayerIndex === room.bigBlindIndex) return true;
   }
 
-  // The round is over if the action has returned to the last aggressor.
   if (room.currentPlayerIndex === aggressorIndex) {
     return true;
   }
 
-  // The round is also over if all remaining players have matched the bet and the aggressor has acted.
   const allMatched = activePlayers.every((p) => p.currentBet === room.minBet);
   if (allMatched && aggressorIndex !== null) {
-    // Check if the current player is the one who made the last raise (and action came around)
     const playerAfterAggressor = findNextActiveIndexFrom(room, aggressorIndex);
     if (
       room.currentPlayerIndex === playerAfterAggressor ||
@@ -335,28 +357,32 @@ function isBettingRoundComplete(room) {
   return false;
 }
 
-/** * Handles the game-ending condition (only one player remains with chips).
- * Resets chips for all players and restarts the game.
- */
+/** Handles the game-ending condition (Phase 6). */
 function endGameAndReset(roomId, io) {
   const room = getRoom(roomId);
   if (!room) return;
 
-  // Find the single winner (player with chips > 0)
   const winner = room.players.find((p) => p.chips > 0);
 
-  // 1. Announce End of Game and Winner (LEADERBOARD)
+  // --- FIX: Send full winner object ---
   io.to(roomId).emit("gameOver", {
-    winnerUsername: winner ? winner.username : "No Winner (all eliminated)",
+    winner: winner
+      ? {
+          // Send full object
+          id: winner.id,
+          userId: winner.userId,
+          username: winner.username,
+          chips: winner.chips,
+        }
+      : null,
     message: winner
-      ? `${winner.username} wins the entire game! Starting Game 2...`
+      ? `${winner.username} wins the entire game! Starting new game...`
       : "Game ended with no clear winner.",
   });
+  // --- END FIX ---
 
-  // 2. Reset Chips for all non-disconnected players (The 1000 chip rule)
   room.players.forEach((p) => {
     if (!p.isDisconnected) {
-      // CRITICAL: Resets the winner's chips (and everyone else's) to 1000
       p.chips = INITIAL_CHIPS;
     }
   });
@@ -365,38 +391,45 @@ function endGameAndReset(roomId, io) {
     `Full game in Room ${roomId} ended. All players reset to ${INITIAL_CHIPS} chips.`
   );
 
-  // 3. Start the new game (Game 2) after a delay
   setTimeout(() => startGame(roomId, io), FULL_GAME_RESET_DELAY);
 }
 
-// nextRound function remains the same...
+// nextRound function
 function nextRound(io, room) {
   reconcilePots(room);
   room.minBet = 0;
   room.lastRaise = 2; // Reset for next round
 
+  // --- FIX: Calculate total pot ---
+  const totalPot = room.pots.reduce((sum, pot) => sum + pot.amount, 0);
+  // --- END FIX ---
+
   const remaining = room.players.filter((p) => !p.hasFolded);
   if (remaining.length <= 1) {
     const winner = remaining[0];
     if (winner) {
-      const totalWinnings = room.pots.reduce((sum, pot) => sum + pot.amount, 0);
-      winner.chips += totalWinnings;
+      winner.chips += totalPot;
+
+      // --- FIX: Update player object for showdown payload ---
+      winner.isWinner = true;
+      winner.winAmount = totalPot;
+      winner.winningHand = "Win by fold";
+      // --- END FIX ---
+
       io.to(room.id).emit("showdown", {
-        results: [
-          {
-            username: winner.username,
-            amount: totalWinnings,
-            hand: "Win by fold",
-          },
-        ],
+        // Send full updated player list
+        players: room.players.map((p) => ({
+          ...p,
+          cards: p.hasFolded ? [] : p.cards, // Show cards only if not folded
+        })),
       });
     }
 
-    // CHECK FOR FULL GAME OVER
     if (checkIfFullGameOver(room)) {
       endGameAndReset(room.id, io);
     } else {
       autoNextHand(room.id, io);
+      G;
     }
     return;
   }
@@ -421,19 +454,22 @@ function nextRound(io, room) {
       break;
   }
 
-  // NEW: Action starts with the first active player after the dealer.
   room.currentPlayerIndex = findNextActiveIndexFrom(room, room.dealerIndex + 1);
-  room.lastRaiserIndex = room.currentPlayerIndex; // The first player to act is the initial 'aggressor' post-flop.
+  room.lastRaiserIndex = room.currentPlayerIndex;
 
+  // --- FIX: Send full payload to gameStore ---
   io.to(room.id).emit("nextRound", {
     round: room.currentRound,
     communityCards: room.communityCards,
-    pots: room.pots,
+    pot: totalPot, // Send single number
+    currentPlayerId: room.players[room.currentPlayerIndex]?.id || null,
+    lastRaise: room.lastRaise,
   });
+  // --- END FIX ---
   emitTurn(io, room);
 }
 
-// showdown and helper functions remain the same...
+// showdown function
 function showdown(io, room) {
   room.handEnded = true;
   reconcilePots(room);
@@ -456,7 +492,13 @@ function showdown(io, room) {
       const player = room.players.find((p) => p.id === winnerInfo.id);
       if (player) {
         player.chips += splitAmount;
+        // --- FIX: Attach winner info to player object ---
+        player.isWinner = true;
+        player.winAmount = (player.winAmount || 0) + splitAmount;
+        player.winningHand = winnerInfo.handName;
+        // --- END FIX ---
         potResults.push({
+          // (still used for messages, can keep)
           username: player.username,
           amount: splitAmount,
           hand: winnerInfo.handDescr,
@@ -465,17 +507,18 @@ function showdown(io, room) {
     });
   }
 
+  // --- FIX: Send full updated player list ---
   io.to(room.id).emit("showdown", {
-    results: potResults,
-    players: showdownPlayers.map((p) => ({
-      username: p.username,
-      cards: p.cards,
-      chips: p.chips,
+    // Send the *entire* player list from the room,
+    // now updated with winner info and chips
+    players: room.players.map((p) => ({
+      ...p,
+      // Ensure cards are visible for all showdown players
+      cards: showdownPlayers.find((sp) => sp.id === p.id) ? p.cards : [],
     })),
-    communityCards: room.communityCards,
   });
+  // --- END FIX ---
 
-  // CHECK FOR FULL GAME OVER
   if (checkIfFullGameOver(room)) {
     endGameAndReset(room.id, io);
   } else {
@@ -483,6 +526,7 @@ function showdown(io, room) {
   }
 }
 
+// postBlind function remains the same...
 function postBlind(player, amount, room) {
   if (!player || player.isSpectator) return;
   const pay = Math.min(player.chips, amount);
@@ -491,6 +535,7 @@ function postBlind(player, amount, room) {
   if (player.chips <= 0) player.isAllIn = true;
 }
 
+// advanceTurn function remains the same...
 function advanceTurn(io, room) {
   room.currentPlayerIndex = findNextActiveIndexFrom(
     room,
@@ -499,10 +544,10 @@ function advanceTurn(io, room) {
   emitTurn(io, room);
 }
 
+// emitTurn function
 function emitTurn(io, room) {
   if (room.handEnded) return;
 
-  // NEW: Check if the round should end before emitting the next turn.
   if (isBettingRoundComplete(room)) {
     nextRound(io, room);
     return;
@@ -510,18 +555,29 @@ function emitTurn(io, room) {
 
   const player = room.players[room.currentPlayerIndex];
   if (!player) {
+    console.log("Error: emitTurn could not find next active player.");
     return;
   }
 
+  // --- FIX: Send full payload to gameStore ---
   io.to(room.id).emit("turnUpdate", {
     playerId: player.id,
     username: player.username,
+    // Add missing state for ActionControls
+    minBet: room.minBet,
+    lastRaise: room.lastRaise,
   });
+  // --- END FIX ---
 
   turnTimers[room.id] = setTimeout(() => {
     if (room.players[room.currentPlayerIndex]?.id === player.id) {
       console.log(`Player ${player.username} timed out. Folding.`);
-      playerAction(room.id, player.id, "fold", 0, io);
+      // --- FIX: Use correct callback signature ---
+      playerAction(room.id, player.id, "fold", 0, io, (res) => {
+        if (!res.success)
+          console.error("Timeout fold action failed:", res.error);
+      });
+      // --- END FIX ---
     }
   }, TURN_TIMEOUT);
 }

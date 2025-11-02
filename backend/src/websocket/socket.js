@@ -3,16 +3,16 @@ import {
   joinRoom,
   leaveRoom,
   getRoom,
-  roomSummary,
+  roomSummary, // Still used for lobby
   getPublicRooms,
 } from "./roomManager.js";
 import { startGame, playerAction } from "../game/gameLogic.js";
 import { getRandomAvatar } from "../utils/avatar.js";
 import jwt from "jsonwebtoken";
-import User from "../models/user.js"; // ✅ Make sure this exists and points to your user model
+import User from "../models/user.js";
 
 // =====================================================
-//  SOCKET INITIALIZATION WITH AUTH MIDDLEWARE
+//  SOCKET INITIALIZATION WITH AUTH MIDDLEWARE
 // =====================================================
 export const initSockets = (io) => {
   // ✅ AUTHENTICATION MIDDLEWARE (runs BEFORE connection event)
@@ -43,13 +43,13 @@ export const initSockets = (io) => {
   });
 
   // =====================================================
-  //  CONNECTION HANDLER
+  //  CONNECTION HANDLER
   // =====================================================
   io.on("connection", (socket) => {
     console.log(`✅ Player connected: ${socket.user.username} (${socket.id})`);
 
     // =====================================================
-    //  GET ROOM LIST
+    //  GET ROOM LIST
     // =====================================================
     socket.on("getRoomList", (callback) => {
       try {
@@ -62,7 +62,7 @@ export const initSockets = (io) => {
     });
 
     // =====================================================
-    //  CREATE ROOM
+    //  CREATE ROOM
     // =====================================================
     socket.on("createRoom", async (data, callback) => {
       try {
@@ -97,7 +97,7 @@ export const initSockets = (io) => {
     });
 
     // =====================================================
-    //  JOIN ROOM
+    //  JOIN ROOM
     // =====================================================
     socket.on("joinRoom", (data, callback) => {
       try {
@@ -127,10 +127,28 @@ export const initSockets = (io) => {
         socket.data.roomId = room.id;
         socket.data.userId = socket.user.id;
 
-        callback?.({ success: true, room: roomSummary(room) });
+        // --- FIX: Create the correct payload for the game room ---
+        const gameRoomPayload = {
+          id: room.id,
+          // Send the full player list
+          players: room.players.map((p) => ({
+            id: p.id,
+            userId: p.userId,
+            username: p.username,
+            avatar: p.avatar,
+            chips: p.chips,
+            isDisconnected: p.isDisconnected,
+          })),
+          hostId: room.players[0]?.userId || null, // Per Phase 1
+        };
+        // --- END FIX ---
 
-        io.to(room.id).emit("roomUpdate", roomSummary(room));
-        io.emit("lobbyUpdate", getPublicRooms());
+        // --- FIX: Send the correct payload ---
+        callback?.({ success: true, room: gameRoomPayload }); // For the person joining
+        io.to(room.id).emit("roomUpdate", gameRoomPayload); // For everyone else
+        // --- END FIX ---
+
+        io.emit("lobbyUpdate", getPublicRooms()); // This is fine
 
         if (!isReconnecting) {
           const systemMessage = {
@@ -147,7 +165,7 @@ export const initSockets = (io) => {
     });
 
     // =====================================================
-    //  CHAT MESSAGE
+    //  CHAT MESSAGE
     // =====================================================
     socket.on("sendMessage", (message, callback) => {
       const roomId = socket.data.roomId;
@@ -177,7 +195,7 @@ export const initSockets = (io) => {
     });
 
     // =====================================================
-    //  START GAME
+    //  START GAME
     // =====================================================
     socket.on("startGame", (payload, callback) => {
       const roomId = socket.data.roomId;
@@ -204,7 +222,7 @@ export const initSockets = (io) => {
     });
 
     // =====================================================
-    //  PLAYER ACTION
+    //  PLAYER ACTION
     // =====================================================
     socket.on("playerAction", (payload, callback) => {
       const roomId = socket.data.roomId;
@@ -231,7 +249,7 @@ export const initSockets = (io) => {
     });
 
     // =====================================================
-    //  DISCONNECT HANDLER
+    //  DISCONNECT HANDLER
     // =====================================================
     socket.on("disconnect", () => {
       const roomId = socket.data.roomId;
